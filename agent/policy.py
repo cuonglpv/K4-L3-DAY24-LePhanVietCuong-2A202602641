@@ -35,6 +35,9 @@ không phải xác thực người dùng production.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -51,5 +54,55 @@ class PolicyContext:
     expires_at: str = ""
 
 
+_VALID_CLASSIFICATIONS = {"public", "internal", "restricted"}
+_PRINCIPALS_PATH = Path(__file__).resolve().parent.parent / "data" / "principals.json"
+
+
+def _principals() -> dict:
+    """Load the trusted lab fixture; it is not a production identity system."""
+    try:
+        return json.loads(_PRINCIPALS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _expired(expires_at: str) -> bool:
+    """A missing, malformed, naive, or elapsed timestamp is fail-closed."""
+    if not expires_at:
+        return True
+    try:
+        instant = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if instant.tzinfo is None:
+        return True
+    return instant.astimezone(timezone.utc) <= datetime.now(timezone.utc)
+
+
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    """Decide a tool request from classification and effective OBO scope."""
+    if context.data_classification not in _VALID_CLASSIFICATIONS:
+        return False, "unknown data classification"
+
+    # This rule is independent of a caller's role: no restricted data goes to
+    # an egress-enabled run.
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return False, "restricted data cannot enter an egress-enabled run"
+
+    principal = _principals().get(context.principal_id)
+    if principal is None:
+        return False, "unknown principal"
+    if not context.requested_tool:
+        return False, "requested tool is required"
+    if context.request_purpose not in set(principal.get("purposes", [])):
+        return False, "purpose is not authorized for this principal"
+    if _expired(context.expires_at):
+        return False, "delegation grant is missing, invalid, or expired"
+
+    effective_tools = set(principal.get("allowed_tools", [])) & set(context.agent_scopes)
+    if context.delegation_depth > 0:
+        effective_tools &= set(context.parent_scopes)
+    if context.requested_tool not in effective_tools:
+        return False, "requested tool is outside the effective OBO scope"
+
+    return True, "principal, purpose, TTL, and effective scope are authorized"
