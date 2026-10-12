@@ -59,7 +59,14 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from agent import tools
+from agent.policy import PolicyContext, check
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
@@ -69,6 +76,94 @@ class RunnerScaffoldPending(NotImplementedError):
     """Only the original 3c stub uses this to enable the CP1/CP2 baseline."""
 
 
+def _hash_args(args: dict) -> str:
+    encoded = json.dumps(args, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _append_audit(entry: dict, path: Path) -> None:
+    """Temporary CP3c JSONL audit; CP3e upgrades it to a hash chain."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _authorize(
+    *, ledger_path: Path, run_id: str, agent_id: str, principal_id: str,
+    expires_at: str, tool: str, args: dict, classification: str,
+    purpose: str, egress_enabled: bool, agent_scopes: tuple[str, ...],
+    parent_scopes: tuple[str, ...] = (), delegation_depth: int = 0,
+) -> bool:
+    allowed, reason = check(PolicyContext(
+        data_classification=classification,
+        request_purpose=purpose,
+        agent_owner=agent_id,
+        delegation_depth=delegation_depth,
+        egress_enabled=egress_enabled,
+        principal_id=principal_id,
+        requested_tool=tool,
+        agent_scopes=agent_scopes,
+        parent_scopes=parent_scopes,
+        expires_at=expires_at,
+    ))
+    _append_audit({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent_id": agent_id,
+        "run_id": run_id,
+        "tool": tool,
+        "args_hash": _hash_args(args),
+        "classification": classification,
+        "decision": "allow" if allowed else "deny",
+        "reason": reason,
+        "on_behalf_of": principal_id,
+        "expires_at": expires_at,
+    }, ledger_path)
+    return allowed
+
+
 def handle(message: str, llm, log_dir: Path | None = None,
            principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+    """Run tool calls on behalf of a simulated principal with PEP checks."""
+    ledger_path = (log_dir / "ledger.jsonl") if log_dir is not None else DEFAULT_LEDGER_PATH
+    run_id = uuid.uuid4().hex
+    agent_id = "lab24-agent/obo-run"
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
+    scopes = ("search_docs", "read_customer")
+
+    docs: list[dict] = []
+    if _authorize(
+        ledger_path=ledger_path, run_id=run_id, agent_id=agent_id,
+        principal_id=principal_id, expires_at=expires_at, tool="search_docs",
+        args={"query": message}, classification="internal",
+        purpose="summarize-tickets", egress_enabled=False, agent_scopes=scopes,
+    ):
+        docs = tools.search_docs(message)
+
+    combined_text = "\n\n".join(str(doc.get("text", "")) for doc in docs)
+    injected = llm.find_injection(combined_text)
+    records: list[dict] = []
+    if injected is not None:
+        for customer_id in injected.customer_ids:
+            if _authorize(
+                ledger_path=ledger_path, run_id=run_id, agent_id=agent_id,
+                principal_id=principal_id, expires_at=expires_at, tool="read_customer",
+                args={"customer_id": customer_id}, classification="restricted",
+                purpose="support-reply", egress_enabled=False, agent_scopes=scopes,
+            ):
+                try:
+                    records.append(tools.read_customer(customer_id))
+                except tools.ToolError:
+                    pass
+
+        # Log the attempted egress before it could execute.  Policy's
+        # restricted+egress rule denies it for every principal.
+        if _authorize(
+            ledger_path=ledger_path, run_id=run_id, agent_id=agent_id,
+            principal_id=principal_id, expires_at=expires_at, tool="http_post",
+            args={"target_url": injected.target_url, "record_count": len(records)},
+            classification="restricted", purpose="support-reply", egress_enabled=True,
+            agent_scopes=scopes,
+        ):
+            tools.http_post(injected.target_url, {"records": records})
+
+    return llm.summarize(docs)
