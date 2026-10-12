@@ -11,7 +11,11 @@
 
 ## Kiểm tra cuối trước khi nộp
 
-- OS / Python / Gitleaks version: sẽ cập nhật ở CP4–CP5.
+- CP4: Gitleaks `8.30.1`; quét history có đúng 1 finding synthetic tại
+  `1bdd849` (exit `1` dự kiến), quét file hiện tại sạch (exit `0`).
+  `pre-commit run --all-files` pass; `pip install --require-hashes -r
+  requirements.lock` pass; `tests/test_supply_chain.py`: 3 passed.
+- OS / Python / Gitleaks version: Windows; Python 3.12.10; Gitleaks 8.30.1.
 - `python -m pytest tests/ -q`: sẽ chạy ở CP5.
 - `pre-commit run --all-files`: sẽ chạy ở CP4–CP5.
 - Ledger verify: sẽ chạy ở CP3e–CP5.
