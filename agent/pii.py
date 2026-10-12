@@ -30,10 +30,51 @@ set ở tests/vn_pii_testset.jsonl):
 """
 from __future__ import annotations
 
+import re
+
+
+_EMAIL_RE = re.compile(
+    r"(?<![\w.+-])[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?![\w-])"
+)
+_PHONE_RE = re.compile(r"(?<!\d)0(?:[ .-]?\d){9,10}(?!\d)")
+_CCCD_RE = re.compile(r"(?<!\d)\d{12}(?!\d)")
+_BANK_RE = re.compile(
+    r"(?i)\b(?:stk|số\s*tài\s*khoản|tai\s*khoan)\b\s*[:#-]?\s*"
+    r"(\d(?:[ .-]?\d){7,15})"
+)
+
+
+def _add_non_overlapping(matches: list[dict], entity_type: str, start: int, end: int) -> None:
+    """Keep the context-aware match when recognizers overlap."""
+    if any(start < entity["end"] and entity["start"] < end for entity in matches):
+        return
+    matches.append({"type": entity_type, "start": start, "end": end})
+
 
 def detect(text: str) -> list[dict]:
-    raise NotImplementedError("BƯỚC 3a: implement PII detection")
+    """Find supported PII without changing offsets in the input text."""
+    matches: list[dict] = []
+
+    # An explicit STK label makes an account match more specific than a
+    # generic twelve-digit CCCD or a phone-like sequence.
+    for match in _BANK_RE.finditer(text):
+        _add_non_overlapping(matches, "VN_BANK_ACCOUNT", match.start(1), match.end(1))
+    for match in _EMAIL_RE.finditer(text):
+        _add_non_overlapping(matches, "EMAIL", match.start(), match.end())
+    for match in _CCCD_RE.finditer(text):
+        _add_non_overlapping(matches, "VN_CCCD", match.start(), match.end())
+    for match in _PHONE_RE.finditer(text):
+        _add_non_overlapping(matches, "VN_PHONE", match.start(), match.end())
+
+    return sorted(matches, key=lambda entity: (entity["start"], entity["end"]))
 
 
 def redact(text: str) -> str:
-    raise NotImplementedError("BƯỚC 3a: implement PII redaction")
+    # Work right-to-left so stored spans remain offsets into the original text.
+    for entity in sorted(detect(text), key=lambda entity: entity["start"], reverse=True):
+        text = (
+            text[: entity["start"]]
+            + f"[REDACTED_{entity['type']}]"
+            + text[entity["end"] :]
+        )
+    return text
