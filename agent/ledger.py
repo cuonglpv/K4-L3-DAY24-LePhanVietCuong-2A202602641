@@ -37,12 +37,59 @@ rồi gọi verify() phải trả về False.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 
+_GENESIS_HASH = "0" * 64
+
+
+def _hash_entry(entry: dict) -> str:
+    """Hash a stable representation that deliberately excludes `hash` itself."""
+    material = {key: value for key, value in entry.items() if key != "hash"}
+    encoded = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
+    """Append an auditable decision with a link to the preceding record."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    previous_hash = _GENESIS_HASH
+    if path.exists() and path.stat().st_size:
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8").splitlines()[-1])
+            previous_hash = str(previous.get("hash", ""))
+        except (OSError, json.JSONDecodeError, IndexError):
+            # Do not hide a malformed prior record by silently repairing it.
+            previous_hash = ""
+
+    stored = dict(entry)
+    stored["prev_hash"] = previous_hash
+    stored["hash"] = _hash_entry(stored)
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(stored, ensure_ascii=False, sort_keys=True) + "\n")
+    return stored
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    """Verify reasons and every link of an on-disk JSONL hash chain."""
+    if not path.exists():
+        return False
+
+    previous_hash = _GENESIS_HASH
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                return False
+            entry = json.loads(line)
+            if not isinstance(entry, dict) or not entry.get("reason"):
+                return False
+            if entry.get("prev_hash") != previous_hash:
+                return False
+            if entry.get("hash") != _hash_entry(entry):
+                return False
+            previous_hash = entry["hash"]
+    except (OSError, TypeError, json.JSONDecodeError):
+        return False
+    return True

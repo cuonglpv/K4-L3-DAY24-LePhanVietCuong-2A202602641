@@ -66,7 +66,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from agent import pii, tools
+from agent import ledger, pii, tools
 from agent.policy import PolicyContext, check
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
@@ -85,10 +85,8 @@ def _hash_args(args: dict) -> str:
 
 
 def _append_audit(entry: dict, path: Path) -> None:
-    """Temporary CP3c JSONL audit; CP3e upgrades it to a hash chain."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+    """Persist every PEP decision through the tamper-evident ledger."""
+    ledger.append(entry, path)
 
 
 def _authorize(
