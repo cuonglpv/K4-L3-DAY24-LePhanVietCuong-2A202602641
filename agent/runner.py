@@ -61,15 +61,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from agent import tools
+from agent import pii, tools
 from agent.policy import PolicyContext, check
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
+CUSTOMERS_PATH = Path(__file__).resolve().parent.parent / "data" / "customers.json"
+_TICKET_NAME_RE = re.compile(r"^ticket-(\d+)[a-z]*\.md$", re.IGNORECASE)
 
 
 class RunnerScaffoldPending(NotImplementedError):
@@ -121,49 +124,85 @@ def _authorize(
     return allowed
 
 
+def _ticket_ids_from_filenames(docs: list[dict]) -> list[int]:
+    """Return typed ticket IDs only from trusted tool metadata, never text."""
+    ticket_ids: set[int] = set()
+    for doc in docs:
+        match = _TICKET_NAME_RE.fullmatch(str(doc.get("id", "")))
+        if match:
+            ticket_ids.add(int(match.group(1)))
+    return sorted(ticket_ids)
+
+
+def _customers_for_tickets(ticket_ids: list[int]) -> list[str]:
+    """Resolve ticket IDs with the trusted related_tickets relation."""
+    try:
+        customers = json.loads(CUSTOMERS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    wanted = set(ticket_ids)
+    return [
+        str(customer["customer_id"])
+        for customer in customers
+        if wanted.intersection(set(customer.get("related_tickets", [])))
+    ]
+
+
 def handle(message: str, llm, log_dir: Path | None = None,
            principal_id: str = "support_l1") -> str:
-    """Run tool calls on behalf of a simulated principal with PEP checks."""
+    """Split untrusted retrieval from private-store access and egress."""
     ledger_path = (log_dir / "ledger.jsonl") if log_dir is not None else DEFAULT_LEDGER_PATH
     run_id = uuid.uuid4().hex
-    agent_id = "lab24-agent/obo-run"
     expires_at = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
-    scopes = ("search_docs", "read_customer")
 
+    # Run A can inspect untrusted documents, but it has no private-data or
+    # egress capability.  Only scalar ticket IDs may cross to Run B.
+    run_a_agent = "lab24-agent/run-a"
     docs: list[dict] = []
     if _authorize(
-        ledger_path=ledger_path, run_id=run_id, agent_id=agent_id,
+        ledger_path=ledger_path, run_id=run_id, agent_id=run_a_agent,
         principal_id=principal_id, expires_at=expires_at, tool="search_docs",
         args={"query": message}, classification="internal",
-        purpose="summarize-tickets", egress_enabled=False, agent_scopes=scopes,
+        purpose="summarize-tickets", egress_enabled=False, agent_scopes=("search_docs",),
     ):
         docs = tools.search_docs(message)
 
-    combined_text = "\n\n".join(str(doc.get("text", "")) for doc in docs)
-    injected = llm.find_injection(combined_text)
-    records: list[dict] = []
+    raw_run_a_text = "\n\n".join(str(doc.get("text", "")) for doc in docs)
+    injected = llm.find_injection(raw_run_a_text)
+    ticket_ids = _ticket_ids_from_filenames(docs)
+    summary_docs = [
+        {"id": doc.get("id", ""), "text": pii.redact(str(doc.get("text", "")))}
+        for doc in docs
+    ]
+
+    # A malicious request may ask for egress, but it has no records and the
+    # PEP denies the attempted capability before tools.http_post can run.
     if injected is not None:
-        for customer_id in injected.customer_ids:
-            if _authorize(
-                ledger_path=ledger_path, run_id=run_id, agent_id=agent_id,
-                principal_id=principal_id, expires_at=expires_at, tool="read_customer",
-                args={"customer_id": customer_id}, classification="restricted",
-                purpose="support-reply", egress_enabled=False, agent_scopes=scopes,
-            ):
-                try:
-                    records.append(tools.read_customer(customer_id))
-                except tools.ToolError:
-                    pass
-
-        # Log the attempted egress before it could execute.  Policy's
-        # restricted+egress rule denies it for every principal.
-        if _authorize(
-            ledger_path=ledger_path, run_id=run_id, agent_id=agent_id,
+        _authorize(
+            ledger_path=ledger_path, run_id=run_id, agent_id=run_a_agent,
             principal_id=principal_id, expires_at=expires_at, tool="http_post",
-            args={"target_url": injected.target_url, "record_count": len(records)},
-            classification="restricted", purpose="support-reply", egress_enabled=True,
-            agent_scopes=scopes,
-        ):
-            tools.http_post(injected.target_url, {"records": records})
+            args={"target_url": injected.target_url}, classification="restricted",
+            purpose="support-reply", egress_enabled=True, agent_scopes=("search_docs",),
+        )
 
-    return llm.summarize(docs)
+    # Run B receives ticket_ids only; it never reads raw ticket content or an
+    # attacker-provided customer ID.
+    run_b_agent = "lab24-agent/run-b"
+    records: list[dict] = []
+    for customer_id in _customers_for_tickets(ticket_ids):
+        if _authorize(
+            ledger_path=ledger_path, run_id=run_id, agent_id=run_b_agent,
+            principal_id=principal_id, expires_at=expires_at, tool="read_customer",
+            args={"customer_id": customer_id}, classification="restricted",
+            purpose="support-reply", egress_enabled=False,
+            agent_scopes=("read_customer",),
+        ):
+            try:
+                records.append(tools.read_customer(customer_id))
+            except tools.ToolError:
+                pass
+
+    # Keep the local variable intentionally: it demonstrates that allowed
+    # reads remain useful, but no Run B operation has an egress capability.
+    del records
+    return llm.summarize(summary_docs)
